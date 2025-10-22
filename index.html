@@ -13,8 +13,6 @@
   .pill{display:inline-flex;align-items:center;gap:8px;font-size:12px;padding:6px 10px;border:1px solid #2a2d35;border-radius:999px;background:#0f1116;color:#cbd5e1}
   .pill.ok{border-color:#1f6f3a;color:#c4f0d0}
   .pill.err{border-color:#6f1f1f;color:#ffc0c0}
-  .banner{display:none;background:#1a2433;border-bottom:1px solid #2a3240;color:#d7faff;padding:10px 16px;font-size:13px}
-  .banner.show{display:block}
 
   main{padding:22px;max-width:1200px;margin:0 auto}
   .grid{display:grid;grid-template-columns:1.1fr .9fr;gap:18px}
@@ -24,19 +22,16 @@
   .row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;margin:10px 0}
   input[type=file]{appearance:none;background:#0f1014;border:1px dashed #2b2b33;border-radius:12px;padding:10px;color:#cbd5e1;width:100%}
   input[type=file]:focus{outline:none;box-shadow:var(--ring)}
-
   .kvs{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
   .kv{background:#0d0f14;border:1px solid #23232b;border-radius:12px;padding:10px}
   .kv label{display:block;color:var(--muted);font-size:12px;margin-bottom:6px}
   .kv input{width:100%;background:#0b0c10;border:1px solid #23232b;border-radius:10px;color:#fff;padding:10px}
   .kv input:focus{outline:none;box-shadow:var(--ring)}
   textarea{width:100%;min-height:72px;background:#0b0c10;border:1px solid #23232b;border-radius:12px;color:#fff;padding:10px;resize:vertical}
-
   .rz{padding:16px}
   .rz h3{margin:.4rem 0 .2rem;font-size:14px;color:#a6ecff}
   .rz .line{margin:.2rem 0}
   .rz ul{margin:.25rem 0 .75rem .9rem}
-
   .bar{display:flex;gap:10px;flex-wrap:wrap}
   .btn{cursor:pointer;background:#111318;border:1px solid #24242a;color:var(--text);padding:10px 14px;border-radius:12px;font-weight:600}
   .btn.accent{border-color:rgba(0,216,255,.5);box-shadow:0 0 0 2px rgba(0,216,255,.12)}
@@ -45,64 +40,145 @@
   .green{color:#8be38b}.red{color:#ffb4b4}
 </style>
 
-<!-- ===== ultra-light ZIP + XLSX parser (DOMParser + robust regex fallback) ===== -->
 <script>
+/* ===== ZIP reader with Deflate (inflate) + XLSX parser — fully offline =====
+   - Supports: deflate (method 8) and stored (method 0)
+   - Returns uncompressed bytes for each file entry
+   - Minimal inflate adapted for small payloads (enough for XLSX XML parts)
+*/
 (function(g){"use strict";
+  // --- tiny inflate (RFC1951) adapted from fflate core, trimmed ---
+  function inflateRaw(src){
+    const s=src, sl=s.length;
+    let ti=0, so=[], pos=0;
+    const get=(n)=>{let v=0, m=1, i=0; for(;i<n;i++,m<<=1){ if(ti>>>3>=sl) throw 'inflate eof'; v|=((s[ti>>>3]>>(ti&7))&1)*m; ti++; } return v };
+    const readBytes=(n)=>{const a=new Uint8Array(n); for(let i=0;i<n;i++) a[i]=get(8); return a};
+    function buildTable(lengths){
+      let n=lengths.length;
+      let max=0; for(let i=0;i<n;i++) if(lengths[i]>max) max=lengths[i];
+      const size=1<<max, table=new Uint16Array(size), offs=new Uint16Array(max+1);
+      for(let i=0;i<n;i++) offs[lengths[i]]++;
+      for(let i=1,sum=0;i<=max;i++){ let c=offs[i]; offs[i]=sum; sum+=c; }
+      const rev=(v,l)=>{v=((v&0x5555)<<1)|((v>>1)&0x5555); v=((v&0x3333)<<2)|((v>>2)&0x3333);
+        v=((v&0x0f0f)<<4)|((v>>4)&0x0f0f); v=(v<<8)|(v>>8); return v>>(16-l)};
+      for(let i=0;i<n;i++){ let l=lengths[i]; if(l){ const code=offs[l]++; const r=rev(code,l), fill=1<<(max-l), val=(i<<4)|l; for(let j=r;j<size;j+=1<<l){ for(let k=0;k<fill;k++) table[j+k]=val; } } }
+      return [table,max];
+    }
+    function huffDecode(table,max){ const code = table[get(max)]; ti-=max-(code&15); return code>>4; }
+    function fixedTables(){
+      const lit=new Uint8Array(288), dist=new Uint8Array(32);
+      for(let i=0;i<144;i++) lit[i]=8; for(let i=144;i<256;i++) lit[i]=9;
+      for(let i=256;i<280;i++) lit[i]=7; for(let i=280;i<288;i++) lit[i]=8;
+      for(let i=0;i<32;i++) dist[i]=5; return [buildTable(lit), buildTable(dist)];
+    }
+    const lenBase=[3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258];
+    const lenExtra=[0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0];
+    const distBase=[1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577];
+    const distExtra=[0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13];
+
+    while(true){
+      const last=get(1), type=get(2);
+      if(type===0){ // stored
+        ti=(ti+7)&~7;
+        const len=get(16), nlen=get(16);
+        if((len^0xffff)!==nlen) throw 'inflate len';
+        so.push(readBytes(len)); pos+=len;
+      } else {
+        let lt,dt;
+        if(type===1){ const t=fixedTables(); lt=t[0]; dt=t[1]; }
+        else if(type===2){
+          const hl=get(5)+257, hd=get(5)+1, hc=get(4)+4;
+          const order=[16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15];
+          const clen=new Uint8Array(19);
+          for(let i=0;i<hc;i++) clen[order[i]]=get(3);
+          const ct=buildTable(clen);
+          const lenArr=[];
+          for(let i=0;i<hl+hd;){
+            const sym=huffDecode(ct[0],ct[1]);
+            if(sym<16){ lenArr[i++]=sym; }
+            else{
+              let repeat=0, val=0;
+              if(sym===16){ repeat=3+get(2); val=lenArr[i-1]||0;}
+              else if(sym===17){ repeat=3+get(3); val=0;}
+              else if(sym===18){ repeat=11+get(7); val=0;}
+              while(repeat--) lenArr[i++]=val;
+            }
+          }
+          const lit= lenArr.slice(0,hl), dist = lenArr.slice(hl);
+          lt=buildTable(lit); dt=buildTable(dist);
+        } else { throw 'inflate type'; }
+
+        // decode stream
+        const out=[];
+        while(true){
+          const sym=huffDecode(lt[0],lt[1]);
+          if(sym===256) break;
+          if(sym<256){ out.push(sym); }
+          else{
+            const i=sym-257, lb=lenBase[i] + (lenExtra[i]? get(lenExtra[i]):0);
+            const di=huffDecode(dt[0],dt[1]);
+            const db=distBase[di] + (distExtra[di]? get(distExtra[di]):0);
+            for(let k=0;k<lb;k++){ const p=pos - db; out.push(so.length? so[so.length-1][p-(so.slice(0,-1).reduce((a,b)=>a+b.length,0))] : out[p]); pos++; }
+            pos-=lb;
+            so.push(new Uint8Array(out.splice(0)));
+          }
+        }
+        so.push(new Uint8Array(out));
+        pos += out.length;
+      }
+      if(last) break;
+    }
+    // concat
+    let len=0; for(const a of so) len+=a.length;
+    const out=new Uint8Array(len); let o=0; for(const a of so){ out.set(a,o); o+=a.length; }
+    return out;
+  }
+
   const td = (u)=>new TextDecoder().decode(u);
-  const te = (s)=>new TextEncoder().encode(s);
-  const u32 = (a,o)=>a[o]|a[o+1]<<8|a[o+2]<<16|a[o+3]<<24;
+  const u16le=(a,o)=>a[o]|(a[o+1]<<8);
+  const u32le=(a,o)=>a[o]|(a[o+1]<<8)|(a[o+2]<<16)|(a[o+3]<<24);
 
   function unzipSync(buf){
     const u=new Uint8Array(buf), L=u.length, EOCD=0x06054b50;
     let p=Math.max(0,L-22-65536);
-    for(;p<L-3 && (u32(u,p)!==EOCD);p++);
+    for(;p<L-3 && (u32le(u,p)!==EOCD);p++);
     if(p>=L-3) throw new Error("ZIP: EOCD not found");
-    const n = u[p+10]|u[p+11]<<8;
-    const ofs = u32(u,p+16);
+    const n = u16le(u,p+10);
+    const ofs = u32le(u,p+16);
     let o=ofs, files={};
     for(let i=0;i<n;i++){
-      if(u32(u,o)!==0x02014b50) throw new Error("ZIP: Bad CEN");
-      const csize=u32(u,o+20), nlen=u[o+32]|u[o+33]<<8, elen=u[o+30]|u[o+31]<<8, clen=u[o+28]|u[o+29]<<8;
-      const lhof=u32(u,o+42);
+      if(u32le(u,o)!==0x02014b50) throw new Error("ZIP: Bad CEN");
+      const cm = u16le(u,o+10);          // compression method (from central dir)
+      const csize=u32le(u,o+20);
+      const nlen=u16le(u,o+32), elen=u16le(u,o+30), clen=u16le(u,o+28);
+      const lhof=u32le(u,o+42);
       const name=td(u.subarray(o+46,o+46+nlen));
-      const lo=lhof, nl=u[lo+26]|u[lo+27]<<8, el=u[lo+28]|u[lo+29]<<8;
+      // local header to find start and method (trust local header)
+      const lo=lhof;
+      const method=u16le(u,lo+8);
+      const nl=u16le(u,lo+26), el=u16le(u,lo+28);
       const dataStart=lo+30+nl+el;
-      files[name]={comp:u.subarray(dataStart,dataStart+csize)};
+      const comp=u.subarray(dataStart,dataStart+csize);
+      let data;
+      if(method===0){ data=comp; }      // stored
+      else if(method===8){ data=inflateRaw(comp); } // deflate
+      else { throw new Error("ZIP: unsupported method "+method); }
+      files[name]={data};
       o+=46+nlen+elen+clen;
     }
     return files;
   }
 
-  function decodeEntities(s){
-    return s.replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&apos;/g,"'");
-  }
-
+  function decodeEntities(s){return s.replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&apos;/g,"'");}
   function parseSharedStringsXML(xml){
-    // combine all <t> inside each <si>
     const sis = xml.split(/<\/si>/i).map(x=>x.split(/<si[^>]*>/i)[1]).filter(Boolean);
-    return sis.map(si=>{
-      let t='';
-      (si.match(/<t[^>]*>[\s\S]*?<\/t>/gi)||[]).forEach(m=>{
-        const inner = m.replace(/<\/?t[^>]*>/gi,'');
-        t += decodeEntities(inner);
-      });
-      return t;
-    });
+    return sis.map(si=>{ let t=''; (si.match(/<t[^>]*>[\s\S]*?<\/t>/gi)||[]).forEach(m=>{t += decodeEntities(m.replace(/<\/?t[^>]*>/gi,''));}); return t; });
   }
-
   function parseWorksheetXML(xml, shared){
-    // Grab rows inside <sheetData>
     const sd = (xml.match(/<sheetData[^>]*>([\s\S]*?)<\/sheetData>/i)||[])[1] || '';
     const rowsXML = sd.split(/<\/row>/i).map(x=>x.split(/<row[^>]*>/i)[1]).filter(Boolean);
-
-    const refToIdx=(r)=>{
-      const m=(r||'A1').match(/[A-Z]+|\d+/g) || ['A','1'];
-      let col=0; const L=m[0];
-      for(let i=0;i<L.length;i++) col = col*26 + (L.charCodeAt(i)-64);
-      return [col-1, parseInt(m[1],10)-1];
-    };
-
-    let grid={}, maxC=0, maxR=0;
+    const refToIdx=(r)=>{const m=(r||'A1').match(/[A-Z]+|\d+/g) || ['A','1']; let col=0; const L=m[0]; for(let i=0;i<L.length;i++) col = col*26 + (L.charCodeAt(i)-64); return [col-1, parseInt(m[1],10)-1]};
+    let grid={}, maxC=0,maxR=0;
     for(const row of rowsXML){
       const cells = row.match(/<c[^>]*>[\s\S]*?<\/c>/gi) || [];
       for(const cxml of cells){
@@ -111,82 +187,43 @@
         const vTag = (cxml.match(/<v[^>]*>([\s\S]*?)<\/v>/i)||[])[1];
         const isTag = (cxml.match(/<is[^>]*>([\s\S]*?)<\/is>/i)||[])[1];
         let val = '';
-        if(t==='s' && vTag!=null){
-          const idx = +vTag;
-          val = (shared[idx]||'');
-        }else if(t==='inlineStr' && isTag){
-          const tparts = isTag.match(/<t[^>]*>([\s\S]*?)<\/t>/gi)||[];
-          val = tparts.map(x=>decodeEntities(x.replace(/<\/?t[^>]*>/gi,''))).join('');
-        }else if(vTag!=null){
-          val = vTag;
-        }
-        const [x,y]=refToIdx(r);
-        grid[x+','+y]=val;
-        if(x>maxC) maxC=x; if(y>maxR) maxR=y;
+        if(t==='s' && vTag!=null){ const idx = +vTag; val = (shared[idx]||''); }
+        else if(t==='inlineStr' && isTag){ const tparts = isTag.match(/<t[^>]*>([\s\S]*?)<\/t>/gi)||[]; val = tparts.map(x=>decodeEntities(x.replace(/<\/?t[^>]*>/gi,''))).join(''); }
+        else if(vTag!=null){ val = vTag; }
+        const [x,y]=refToIdx(r); grid[x+','+y]=val; if(x>maxC)maxC=x; if(y>maxR)maxR=y;
       }
     }
-    const aoa=[];
-    for(let r=0;r<=maxR;r++){ const row=[]; for(let c=0;c<=maxC;c++){ row.push(grid[c+','+r]||''); } aoa.push(row); }
-    const headers=(aoa[0]||[]).map(h=>String(h));
-    const out=[];
-    for(let i=1;i<aoa.length;i++){
-      const row=aoa[i]; if(row.every(x=>String(x).trim()==='')) continue;
-      const obj={}; headers.forEach((h,idx)=> obj[h]= row[idx]||''); out.push(obj);
-    }
+    const aoa=[]; for(let r=0;r<=maxR;r++){ const arr=[]; for(let c=0;c<=maxC;c++){ arr.push(grid[c+','+r]||''); } aoa.push(arr); }
+    const headers=(aoa[0]||[]).map(h=>String(h)); const out=[];
+    for(let i=1;i<aoa.length;i++){ const row=aoa[i]; if(row.every(x=>String(x).trim()==='')) continue; const obj={}; headers.forEach((h,idx)=> obj[h]= row[idx]||''); out.push(obj); }
     return out;
   }
-
   async function parseXLSX(ab){
-    const files = unzipSync(ab);
-    const wsPath = Object.keys(files).filter(p=>/^xl\/worksheets\/sheet\d+\.xml$/i.test(p)).sort()[0];
+    const files=unzipSync(ab);
+    const wsPath=Object.keys(files).filter(p=>/^xl\/worksheets\/sheet\d+\.xml$/i.test(p)).sort()[0];
     if(!wsPath) throw new Error('XLSX: no worksheet found');
-
-    const dec = new TextDecoder();
-    const sstXML = files['xl/sharedStrings.xml'] ? dec.decode(files['xl/sharedStrings.xml'].comp) : '';
-    const wsXML  = dec.decode(files[wsPath].comp);
-
-    // Try DOMParser first, then fallback to regex/tokenizer
+    const dec=new TextDecoder();
+    const sstXML = files['xl/sharedStrings.xml'] ? dec.decode(files['xl/sharedStrings.xml'].data) : '';
+    const wsXML  = dec.decode(files[wsPath].data);
+    // Try DOMParser, fallback to regex tokenizer
     try{
-      const sstVals = sstXML ? Array.from(new DOMParser().parseFromString(sstXML,'application/xml').getElementsByTagName('si')).map(si=>{
-        let t=''; si.querySelectorAll('t').forEach(n=>t+=n.textContent); return t;
-      }) : [];
-      const doc = new DOMParser().parseFromString(wsXML,'application/xml');
-      const rows = Array.from(doc.getElementsByTagName('row'));
-      const getVal=(c)=>{
-        const t=c.getAttribute('t'), v=c.getElementsByTagName('v')[0], is=c.getElementsByTagName('is')[0];
-        if(t==='s' && v) return sstVals[+v.textContent]||'';
-        if(t==='inlineStr' && is) return (is.textContent||'');
-        if(v) return v.textContent;
-        return '';
-      };
+      const sstVals = sstXML ? Array.from(new DOMParser().parseFromString(sstXML,'application/xml').getElementsByTagName('si')).map(si=>{let t=''; si.querySelectorAll('t').forEach(n=>t+=n.textContent); return t;}) : [];
+      const doc = new DOMParser().parseFromString(wsXML,'application/xml'); const rows = Array.from(doc.getElementsByTagName('row'));
+      const getVal=(c)=>{const t=c.getAttribute('t'); const v=c.getElementsByTagName('v')[0]; const is=c.getElementsByTagName('is')[0]; if(t==='s'&&v) return sstVals[+v.textContent]||''; if(t==='inlineStr'&&is) return (is.textContent||''); if(v) return v.textContent; return ''};
       const refToIdx=(r)=>{const m=r.match(/[A-Z]+|\d+/g);let col=0;const L=m[0];for(let i=0;i<L.length;i++) col=col*26+(L.charCodeAt(i)-64);return [col-1,parseInt(m[1],10)-1]};
-      let maxC=0,maxR=0,grid={};
-      rows.forEach(row=>{
-        Array.from(row.getElementsByTagName('c')).forEach(c=>{
-          const ref=c.getAttribute('r')||'A1';
-          const [x,y]=refToIdx(ref);
-          grid[x+','+y]=getVal(c);
-          if(x>maxC)maxC=x;if(y>maxR)maxR=y;
-        });
-      });
-      const aoa=[];for(let r=0;r<=maxR;r++){const arr=[];for(let c=0;c<=maxC;c++){arr.push(grid[c+','+r]||'')}aoa.push(arr)}
-      const headers=(aoa[0]||[]).map(String);
-      const out=[];for(let i=1;i<aoa.length;i++){const row=aoa[i];if(row.every(x=>String(x).trim()===''))continue;const obj={};headers.forEach((h,idx)=>obj[h]=row[idx]||'');out.push(obj)};return out;
+      let maxC=0,maxR=0,grid={}; rows.forEach(row=>{Array.from(row.getElementsByTagName('c')).forEach(c=>{const ref=c.getAttribute('r')||'A1'; const [x,y]=refToIdx(ref); grid[x+','+y]=getVal(c); if(x>maxC)maxC=x;if(y>maxR)maxR=y;});});
+      const aoa=[]; for(let r=0;r<=maxR;r++){ const arr=[]; for(let c=0;c<=maxC;c++){ arr.push(grid[c+','+r]||''); } aoa.push(arr); }
+      const headers=(aoa[0]||[]).map(String); const out=[]; for(let i=1;i<aoa.length;i++){ const row=aoa[i]; if(row.every(x=>String(x).trim()==='')) continue; const obj={}; headers.forEach((h,idx)=> obj[h]= row[idx]||''); out.push(obj);} return out;
     }catch(e){
-      // Fallback: regex parser (works in file:// and locked contexts)
-      const sstVals = sstXML ? parseSharedStringsXML(sstXML) : [];
-      return parseWorksheetXML(wsXML, sstVals);
+      const sstVals = sstXML ? parseSharedStringsXML(sstXML) : []; return parseWorksheetXML(wsXML, sstVals);
     }
   }
-
-  g.__miniXLSX = { unzipSync, parseXLSX, te };
+  g.__XLSX = { parseXLSX };
 })(this);
 </script>
 </head>
 
 <body>
-<div id="protoBanner" class="banner">Tip: Opening via <b>http://localhost</b> is fastest, but this build also parses XLSX even as <code>file://</code>.</div>
-
 <header>
   <div class="title"><h1>Retail Zipline • Daily Message Builder</h1></div>
   <div id="libStatus" class="pill ok">Offline: CSV & XLSX supported</div>
@@ -209,7 +246,7 @@
           <input id="feesFile" type="file" accept=".csv,.xlsx" />
           <span id="fStatus" class="pill">Fees & Donations: N/A</span>
         </div>
-        <div class="hint">Parses <b>CSV</b> and <b>XLSX</b> fully offline. If an older <code>.xls</code> appears, save as <code>.xlsx</code> or CSV.</div>
+        <div class="hint">Parses <b>CSV</b> and <b>XLSX</b> fully offline (no external libraries). If an older <code>.xls</code> appears, save as <code>.xlsx</code> or CSV.</div>
 
         <h2 style="margin-top:14px">2) Goals & Notes</h2>
         <div class="body" style="padding-top:8px">
@@ -254,153 +291,62 @@
 </main>
 
 <script>
-/* ===== helper utils ===== */
+/* ===== helpers & business logic ===== */
 const $=id=>document.getElementById(id);
 const money=n=>isFinite(n)? Number(n).toLocaleString(undefined,{style:'currency',currency:'USD'}):'N/A';
 const cleanMoney=s=>Number(String(s||'').replace(/[^0-9.\-]/g,''));
 const ord=d=>{const j=d%10,k=d%100; if(j==1&&k!=11) return 'st'; if(j==2&&k!=12) return 'nd'; if(j==3&&k!=13) return 'rd'; return 'th'};
 function fullDate(d){return d.toLocaleString(undefined,{month:'long'})+" "+d.getDate()+ord(d.getDate())+", "+d.getFullYear()}
-
-/* robust CSV parser */
-function parseCSV(text){
-  const rows=[]; let i=0, field='', row=[], inQ=false; const push=()=>{row.push(field); field='';};
-  for(; i<text.length; i++){
-    const ch=text[i], nx=text[i+1];
-    if(inQ){
-      if(ch==='"' && nx==='"'){ field+='"'; i++; }
-      else if(ch==='"'){ inQ=false; }
-      else field+=ch;
-    }else{
-      if(ch==='"') inQ=true;
-      else if(ch===',') push();
-      else if(ch==='\n'){ push(); rows.push(row); row=[]; }
-      else if(ch==='\r'){ /* ignore */ }
-      else field+=ch;
-    }
-  }
-  push(); rows.push(row);
-  const headers=(rows.shift()||[]).map(h=>h.trim());
-  const out=[]; for(const r of rows){ if(r.every(c=>!String(c).trim())) continue; const obj={}; headers.forEach((h,idx)=> obj[h]=(r[idx]||'').trim()); out.push(obj); }
-  return out;
-}
-
-/* file loader */
-async function fileToRows(file){
-  const name=(file.name||'').toLowerCase();
-  if(name.endsWith('.csv')) return parseCSV(await file.text());
-  if(name.endsWith('.xlsx')){
-    try { const buf=await file.arrayBuffer(); return await __miniXLSX.parseXLSX(buf); }
-    catch(err){
-      document.getElementById('protoBanner').classList.add('show');
-      throw err;
-    }
-  }
-  const er=$('error'); er.style.display='block'; er.textContent='Unsupported file type: '+file.name+' — please upload CSV or XLSX.'; return null;
-}
-
-/* business parsers */
-function parseClosing(rows){
-  const out={netSales:NaN,atv:NaN,txns:NaN,deliveries:NaN}; if(!rows||!rows.length) return out;
-  const norm=s=>String(s||'').toLowerCase();
-  const headers=Object.keys(rows[0]||{});
-  const findHeader=(...need)=> headers.find(h=>need.every(n=>norm(h).includes(n)));
-  const hNet=findHeader('net','sales');
-  const hAtv=findHeader('avg','$','cart')||findHeader('average','order')||findHeader('aov');
-  const hTxn=findHeader('transactions')||findHeader('orders');
-  const hTender=findHeader('tender')||findHeader('payment')||findHeader('type');
-  const hDesc=findHeader('desc')||findHeader('memo')||findHeader('note');
+function parseCSV(text){const rows=[]; let i=0, field='', row=[], inQ=false; const push=()=>{row.push(field); field='';};
+  for(; i<text.length; i++){const ch=text[i], nx=text[i+1]; if(inQ){ if(ch=='"'&&nx=='"'){field+='"';i++;} else if(ch=='"'){inQ=false;} else field+=ch;}
+  else{ if(ch=='"') inQ=true; else if(ch==',') push(); else if(ch=='\n'){push(); rows.push(row); row=[];} else if(ch=='\r'){} else field+=ch;}}
+  push(); rows.push(row); const headers=(rows.shift()||[]).map(h=>h.trim()); const out=[]; for(const r of rows){ if(r.every(c=>!String(c).trim())) continue; const obj={}; headers.forEach((h,idx)=> obj[h]=(r[idx]||'').trim()); out.push(obj);} return out;}
+async function fileToRows(file){const name=(file.name||'').toLowerCase(); if(name.endsWith('.csv')) return parseCSV(await file.text()); if(name.endsWith('.xlsx')){ const buf=await file.arrayBuffer(); return await __XLSX.parseXLSX(buf);} const er=$('error'); er.style.display='block'; er.textContent='Unsupported file type: '+file.name; return null;}
+function parseClosing(rows){const out={netSales:NaN,atv:NaN,txns:NaN,deliveries:NaN}; if(!rows||!rows.length) return out;
+  const norm=s=>String(s||'').toLowerCase(); const headers=Object.keys(rows[0]||{}); const findHeader=(...need)=> headers.find(h=>need.every(n=>norm(h).includes(n)));
+  const hNet=findHeader('net','sales'); const hAtv=findHeader('avg','$','cart')||findHeader('average','order')||findHeader('aov'); const hTxn=findHeader('transactions')||findHeader('orders'); const hTender=findHeader('tender')||findHeader('payment')||findHeader('type'); const hDesc=findHeader('desc')||findHeader('memo')||findHeader('note');
   if(hNet){ for(let i=rows.length-1;i>=0;i--){ const n=cleanMoney(rows[i][hNet]); if(isFinite(n)){ out.netSales=n; break; } } }
   if(hAtv){ for(let i=rows.length-1;i>=0;i--){ const n=cleanMoney(rows[i][hAtv]); if(isFinite(n)){ out.atv=n; break; } } }
   if(hTxn){ let maxN=NaN; for(const r of rows){ const n=Number(String(r[hTxn]).replace(/[^0-9]/g,'')); if(isFinite(n)) maxN=isFinite(maxN)?Math.max(maxN,n):n; } out.txns=maxN; }
-  let deliveries=0; if(hTender||hDesc){ for(const r of rows){ const s=(String(hTender? r[hTender]:'')+' '+String(hDesc? r[hDesc]: '')).toLowerCase(); if(/gift\s*card/.test(s)) deliveries++; } }
-  if(deliveries>0) out.deliveries=deliveries;
-  return out;
-}
-function parseFees(rows){
-  let count=0; const names=new Set(); if(!rows) return {count:0,names:[]};
-  const headers=rows.length? Object.keys(rows[0]):[];
-  const nameCols=headers.filter(h=>/name|employee|budtender|associate/i.test(h));
-  for(const r of rows){
-    const line=Object.values(r).join(' ');
-    if(/frequent\s*flyer/i.test(line)){
-      count++; for(const c of nameCols){ const v=String(r[c]||'').trim(); if(v && !/frequent|flyer|donation|fees|total/i.test(v)) names.add(v); }
-    }
-  }
-  return {count, names:[...names]};
-}
+  let deliveries=0; if(hTender||hDesc){ for(const r of rows){ const s=(String(hTender? r[hTender]:'')+' '+String(hDesc? r[hDesc]: '')).toLowerCase(); if(/gift\s*card/.test(s)) deliveries++; } } if(deliveries>0) out.deliveries=deliveries; return out; }
+function parseFees(rows){let count=0; const names=new Set(); if(!rows) return {count:0,names:[]}; const headers=rows.length? Object.keys(rows[0]):[]; const nameCols=headers.filter(h=>/name|employee|budtender|associate/i.test(h)); for(const r of rows){ const line=Object.values(r).join(' '); if(/frequent\s*flyer/i.test(line)){ count++; for(const c of nameCols){ const v=String(r[c]||'').trim(); if(v && !/frequent|flyer|donation|fees|total/i.test(v)) names.add(v); } } } return {count, names:[...names]}; }
 
-/* UI & compute */
 const S={y:null,w:null,f:null};
 function setPill(id,text,ok){ const el=$(id); el.textContent=text; el.classList.remove('ok','err'); if(ok===true) el.classList.add('ok'); if(ok===false) el.classList.add('err'); }
-function hookInput(inputId,key){
-  $(inputId).addEventListener('change', async (e)=>{
-    const f=e.target.files[0]; if(!f) return; setPill(key+'Status','Reading…');
-    try{
-      const rows=await fileToRows(f);
-      if(!rows){ setPill(key+'Status','No data',false); return; }
-      const parsed=(key==='f')?parseFees(rows):parseClosing(rows);
-      S[key]=parsed; setPill(key+'Status','Parsed ✓',true);
-    }catch(err){
-      console.error(err); setPill(key+'Status','Error',false);
-      const er=$('error'); er.style.display='block'; er.textContent=err.message||String(err);
-    }
-  });
-}
+function hookInput(inputId,key){ $(inputId).addEventListener('change', async (e)=>{ const f=e.target.files[0]; if(!f) return; setPill(key+'Status','Reading…'); try{ const rows=await fileToRows(f); if(!rows){ setPill(key+'Status','No data',false); return;} const parsed=(key==='f')?parseFees(rows):parseClosing(rows); S[key]=parsed; setPill(key+'Status','Parsed ✓',true);} catch(err){ console.error(err); setPill(key+'Status','Error',false); const er=$('error'); er.style.display='block'; er.textContent=err.message||String(err);} }); }
 hookInput('yesterdayFile','y'); hookInput('weekFile','w'); hookInput('feesFile','f');
 
-function render(){
-  const y=S.y||{}; const w=S.w||{}; const f=S.f||{count:0,names:[]};
-  const d=new Date(); const titleDate=fullDate(d);
-  const tx=y.txns; const del=y.deliveries||0;
-  const inStore = isFinite(tx-del)? Math.max(0,tx-del) : (isFinite(tx)?tx:NaN);
+function render(){ const y=S.y||{}; const w=S.w||{}; const f=S.f||{count:0,names:[]}; const d=new Date(); const titleDate=fullDate(d);
+  const tx=y.txns; const del=y.deliveries||0; const inStore = isFinite(tx-del)? Math.max(0,tx-del) : (isFinite(tx)?tx:NaN);
   const totalTx = (isFinite(inStore)&&isFinite(del)) ? inStore + del : (isFinite(tx)? tx : NaN);
   const totalDel = isFinite(del) ? del : NaN;
-
-  const weekly = cleanMoney($('goalWeekly').value);
-  const tgoal  = cleanMoney($('goalToday').value);
-  const rewards= Number($('rewards').value)||0;
-  const atvLW  = cleanMoney($('atvLastWeek').value);
-
-  const rz = `
-    <h3>Title</h3>
-    <div class="line">${titleDate}</div>
-
-    <h3>Sales Recap</h3>
-    <ul>
-      <li>Yesterday’s Sales: <strong>${money(y.netSales)}</strong></li>
-      <li>Same Day Last Week: <strong>${money(w.netSales)}</strong></li>
-      <li>Weekly Goal: <strong>${isFinite(weekly)?money(weekly):'N/A'}</strong></li>
-      <li>Today’s Goal: <strong>${isFinite(tgoal)?money(tgoal):'N/A'}</strong></li>
+  const weekly = cleanMoney($('goalWeekly').value); const tgoal  = cleanMoney($('goalToday').value); const rewards= Number($('rewards').value)||0; const atvLW  = cleanMoney($('atvLastWeek').value);
+  const rz = `<h3>Title</h3><div class="line">${titleDate}</div>
+  <h3>Sales Recap</h3><ul>
+    <li>Yesterday’s Sales: <strong>${money(y.netSales)}</strong></li>
+    <li>Same Day Last Week: <strong>${money(w.netSales)}</strong></li>
+    <li>Weekly Goal: <strong>${isFinite(weekly)?money(weekly):'N/A'}</strong></li>
+    <li>Today’s Goal: <strong>${isFinite(tgoal)?money(tgoal):'N/A'}</strong></li>
+  </ul>
+  <h3>Performance Metrics</h3><ul>
+    <li>Yesterday’s Frequent Flyer Count: <strong>${f.count||0}</strong></li>
+    <li>ATV (Yesterday): <strong>${money(y.atv)}</strong></li>
+    <li>ATV (Last Week): <strong>${isFinite(atvLW)?money(atvLW):(isFinite(w.atv)?money(w.atv):'N/A')}</strong></li>
+    <li>Total Transactions: <strong>${isFinite(totalTx)?totalTx:'N/A'}</strong></li>
+    <li>Total Deliveries (Gift Cards Used): <strong>${isFinite(totalDel)?totalDel:'N/A'}</strong></li>
+    <li>Reward Redemptions: <strong>${rewards||0}</strong></li>
+    <li>Transactions Yesterday:</li><ul>
+      <li>In-Store: <strong>${isFinite(inStore)?inStore:'N/A'}</strong></li>
+      <li>Delivery: <strong>${isFinite(del)?del:'N/A'}</strong></li>
     </ul>
-
-    <h3>Performance Metrics</h3>
-    <ul>
-      <li>Yesterday’s Frequent Flyer Count: <strong>${f.count||0}</strong></li>
-      <li>ATV (Yesterday): <strong>${money(y.atv)}</strong></li>
-      <li>ATV (Last Week): <strong>${isFinite(atvLW)?money(atvLW): (isFinite(w.atv)? money(w.atv):'N/A')}</strong></li>
-      <li>Total Transactions: <strong>${isFinite(totalTx)?totalTx:'N/A'}</strong></li>
-      <li>Total Deliveries (Gift Cards Used): <strong>${isFinite(totalDel)?totalDel:'N/A'}</strong></li>
-      <li>Reward Redemptions: <strong>${rewards||0}</strong></li>
-      <li>Transactions Yesterday:</li>
-      <ul>
-        <li>In-Store: <strong>${isFinite(inStore)?inStore:'N/A'}</strong></li>
-        <li>Delivery: <strong>${isFinite(del)?del:'N/A'}</strong></li>
-      </ul>
-    </ul>
-
-    <h3>Team Shoutouts</h3>
-    <div class="line">${($('shoutouts').value|| (f.names&&f.names.length? 'Shoutouts: '+f.names.join(', '): '')) || '<em>—</em>'}</div>
-    <h3>Focus Areas</h3>
-    <div class="line">${$('focus').value||'<em>—</em>'}</div>
-    <h3>Inventory Updates</h3>
-    <div class="line">${$('inventory').value||'<em>—</em>'}</div>
-    <h3>Cash Updates</h3>
-    <div class="line">${$('cash').value||'<em>—</em>'}</div>
-  `;
+  </ul>
+  <h3>Team Shoutouts</h3><div class="line">${($('shoutouts').value||(f.names&&f.names.length? 'Shoutouts: '+f.names.join(', '):'')) || '<em>—</em>'}</div>
+  <h3>Focus Areas</h3><div class="line">${$('focus').value||'<em>—</em>'}</div>
+  <h3>Inventory Updates</h3><div class="line">${$('inventory').value||'<em>—</em>'}</div>
+  <h3>Cash Updates</h3><div class="line">${$('cash').value||'<em>—</em>'}</div>`;
   $('rz').innerHTML = rz;
 
-  const lines=[];
-  lines.push(titleDate,'','Sales Recap',
+  const lines=[]; lines.push(titleDate,'','Sales Recap',
     `Yesterday’s Sales: ${money(y.netSales)}`,
     `Same Day Last Week: ${money(w.netSales)}`,
     `Weekly Goal: ${isFinite(weekly)?money(weekly):'N/A'}`,
@@ -409,7 +355,7 @@ function render(){
     'Performance Metrics',
     `Yesterday’s Frequent Flyer Count: ${f.count||0}`,
     `ATV (Yesterday): ${money(y.atv)}`,
-    `ATV (Last Week): ${isFinite(atvLW)?money(atvLW): (isFinite(w.atv)? money(w.atv):'N/A')}`,
+    `ATV (Last Week): ${isFinite(atvLW)?money(atvLW):(isFinite(w.atv)?money(w.atv):'N/A')}`,
     `Total Transactions: ${isFinite(totalTx)? totalTx:'N/A'}`,
     `Total Deliveries (Gift Cards Used): ${isFinite(totalDel)? totalDel:'N/A'}`,
     `Reward Redemptions: ${rewards||0}`,
@@ -422,101 +368,50 @@ function render(){
   if($('focus').value) lines.push('Focus Areas: '+$('focus').value);
   if($('inventory').value) lines.push('Inventory Updates: '+$('inventory').value);
   if($('cash').value) lines.push('Cash Updates: '+$('cash').value);
-
   return lines.join('\n');
 }
 
-$('generate').addEventListener('click',()=>{ try{ window.__rz_text = render(); }catch(err){ const er=$('error'); er.style.display='block'; er.textContent=err.message||String(err); }});
+$('generate').addEventListener('click',()=>{ try{ window.__rz_text = render(); } catch(err){ const er=$('error'); er.style.display='block'; er.textContent = err.message||String(err); } });
 $('copyBtn').addEventListener('click',()=>{ const txt = window.__rz_text || render(); navigator.clipboard.writeText(txt).then(()=>{ $('copyBtn').textContent='Copied!'; setTimeout(()=>{$('copyBtn').textContent='Copy'},1200); }); });
-$('downloadBtn').addEventListener('click',()=>{ const txt = window.__rz_text || render(); const blob = new Blob([txt], {type:'text/plain'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='RetailZipline_DailyMessage.txt'; a.click(); });
+$('downloadBtn').addEventListener('click',()=>{ const txt = window.__rz_text || render(); const blob = new Blob([txt],{type:'text/plain'}); const a=document.createElement('a'); a.href = URL.createObjectURL(blob); a.download='RetailZipline_DailyMessage.txt'; a.click(); });
 
 /* ===== tests ===== */
-document.getElementById('runTests').addEventListener('click',async()=>{
-  try{
-    // CSV tests
-    const closingCSV='Header,Value\nNet Sales,$12345.67\nAvg $/Cart,$42.10\nTransactions,321\nTender,Gift Card\nTender,Cash';
-    const feesCSV='Employee,Type,Amount\nAlex,Frequent Flyer,$5\nSam,Donation,$2\nPat,Frequent Flyer,$5';
-    const y=parseClosing(parseCSV(closingCSV));
-    const f=parseFees(parseCSV(feesCSV));
-
-    // XLSX test: tiny workbook in-memory
-    const enc=t=>new TextEncoder().encode(t);
-    const sst='<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-      +'<si><t>Header</t></si><si><t>Value</t></si>'
-      +'<si><t>Net Sales</t></si><si><t>Avg $/Cart</t></si>'
-      +'<si><t>Transactions</t></si><si><t>Tender</t></si>'
-      +'<si><t>Gift Card</t></si><si><t>Cash</t></si></sst>';
-    const sheet1='<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'
-      +'<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>'
-      +'<row r="2"><c r="A2" t="s"><v>2</v></c><c r="B2">12345.67</c></row>'
-      +'<row r="3"><c r="A3" t="s"><v>3</v></c><c r="B3">42.1</c></row>'
-      +'<row r="4"><c r="A4" t="s"><v>4</v></c><c r="B4">321</c></row>'
-      +'<row r="5"><c r="A5" t="s"><v>5</v></c><c r="B5" t="s"><v>6</v></c></row>'
-      +'<row r="6"><c r="A6" t="s"><v>5</v></c><c r="B6" t="s"><v>7</v></c></row>'
-      +'</sheetData></worksheet>';
-    const wb='<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>';
-    const rels='<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.xml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"/></Relationships>';
-    const contentTypes='<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>';
-    const relsRoot='<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId0" Target="xl/workbook.xml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"/></Relationships>';
-
-    function zipSync(map){
-      function u16(v){const a=new Uint8Array(2); new DataView(a.buffer).setUint16(0,v,true); return a}
-      function u32(v){const a=new Uint8Array(4); new DataView(a.buffer).setUint32(0,v,true); return a}
-      function concat(parts){let L=0; for(const p of parts) L+=p.length; const out=new Uint8Array(L); let o=0; for(const p of parts){out.set(p,o); o+=p.length} return out}
-      function crc32(d){let c=~0>>>0; const T=new Uint32Array(256).map((_,n)=>{let x=n;for(let i=0;i<8;i++) x = (x&1)? (0xEDB88320 ^ (x>>>1)) : (x>>>1); return x}); for(let i=0;i<d.length;i++) c = (c>>>8) ^ T[(c ^ d[i]) & 255]; return (~c)>>>0}
-      let files=[], cd=[], offset=0;
-      for(const name in map){
-        const data = map[name];
-        const n = new TextEncoder().encode(name);
-        const crc = crc32(data);
-        const lfh = concat([Uint8Array.from([0x50,0x4b,3,4,10,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]), u16(n.length), u16(0), u16(0), n, data]);
-        new DataView(lfh.buffer,14,4).setUint32(0,crc,true);
-        new DataView(lfh.buffer,18,4).setUint32(0,data.length,true);
-        new DataView(lfh.buffer,22,4).setUint32(0,data.length,true);
-        files.push(lfh);
-        const cen = concat([Uint8Array.from([0x50,0x4b,1,2,0,0,10,0,0,0,0,0,0,0,0,0,0,0,0,0]), u16(n.length), u16(0), u16(0), u16(0), u16(0), u32(crc), u32(data.length), u32(data.length), u32(0), u32(offset), n]);
-        cd.push(cen);
-        offset += lfh.length;
-      }
-      const cdBlob = concat(cd);
-      const eocd = concat([Uint8Array.from([0x50,0x4b,5,6,0,0]), u16(cd.length), u16(cd.length), u32(cdBlob.length), u32(offset), u16(0)]);
-      return concat([...files, cdBlob, eocd]);
+document.getElementById('runTests').addEventListener('click',async()=>{ try{
+  const closingCSV='Header,Value\nNet Sales,$12345.67\nAvg $/Cart,$42.10\nTransactions,321\nTender,Gift Card\nTender,Cash';
+  const feesCSV='Employee,Type,Amount\nAlex,Frequent Flyer,$5\nSam,Donation,$2\nPat,Frequent Flyer,$5';
+  const y=parseClosing(parseCSV(closingCSV)); const f=parseFees(parseCSV(feesCSV));
+  // Build tiny XLSX zip to verify deflate path too
+  const enc=t=>new TextEncoder().encode(t);
+  function zipStore(map){ // store-only for test body; headers built below with crc 0
+    function u16(v){const a=new Uint8Array(2); new DataView(a.buffer).setUint16(0,v,true); return a}
+    function u32(v){const a=new Uint8Array(4); new DataView(a.buffer).setUint32(0,v,true); return a}
+    function concat(parts){let L=0; for(const p of parts) L+=p.length; const out=new Uint8Array(L); let o=0; for(const p of parts){out.set(p,o); o+=p.length} return out}
+    function crc32(d){let c=~0>>>0; const T=new Uint32Array(256).map((_,n)=>{let x=n;for(let i=0;i<8;i++) x=(x&1)?(0xEDB88320^(x>>>1)):(x>>>1); return x}); for(let i=0;i<d.length;i++) c=(c>>>8)^T[(c^d[i])&255]; return (~c)>>>0}
+    let files=[], cd=[], offset=0;
+    for(const name in map){
+      const data=map[name]; const n=enc(name); const crc=crc32(data);
+      const lfh=concat([Uint8Array.from([0x50,0x4b,3,4,10,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]),u16(n.length),u16(0),u16(0),n,data]);
+      new DataView(lfh.buffer,14,4).setUint32(0,crc,true);
+      new DataView(lfh.buffer,18,4).setUint32(0,data.length,true);
+      new DataView(lfh.buffer,22,4).setUint32(0,data.length,true);
+      files.push(lfh);
+      const cen=concat([Uint8Array.from([0x50,0x4b,1,2,0,0,10,0,0,0,0,0,0,0,0,0,0,0,0,0]),u16(n.length),u16(0),u16(0),u16(0),u16(0),u32(crc),u32(data.length),u32(data.length),u32(0),u32(offset),n]);
+      cd.push(cen); offset+=lfh.length;
     }
-
-    const zip = zipSync({
-      '[Content_Types].xml': enc(contentTypes),
-      '_rels/.rels': enc(relsRoot),
-      'xl/workbook.xml': enc(wb),
-      'xl/_rels/workbook.xml.rels': enc(rels),
-      'xl/sharedStrings.xml': enc(sst),
-      'xl/worksheets/sheet1.xml': enc(sheet1)
-    });
-
-    const rowsX = await __miniXLSX.parseXLSX(zip.buffer);
-    const yx = parseClosing(rowsX);
-
-    const okCSV = isFinite(y.netSales)&&Math.abs(y.netSales-12345.67)<1e-6
-               && isFinite(y.atv)&&Math.abs(y.atv-42.1)<1e-6
-               && isFinite(y.txns)&&y.txns===321
-               && y.deliveries===1
-               && (parseFees(parseCSV(feesCSV)).count===2);
-
-    const okXLSX = isFinite(yx.netSales)&&Math.abs(yx.netSales-12345.67)<1e-6
-                && isFinite(yx.atv)&&Math.abs(yx.atv-42.1)<1e-6
-                && isFinite(yx.txns)&&yx.txns===321
-                && yx.deliveries===1;
-
-    $('testOut').innerHTML = (okCSV && okXLSX)
-      ? '<span class="green">All tests passed (CSV + XLSX).</span>'
-      : '<span class="red">Tests failed.</span>';
-  }catch(e){
-    $('testOut').innerHTML = '<span class="red">Test error: '+(e.message||e)+'</span>';
+    const cdBlob=concat(cd); const eocd=concat([Uint8Array.from([0x50,0x4b,5,6,0,0]),u16(cd.length),u16(cd.length),u32(cdBlob.length),u32(offset),u16(0)]); return concat([...files,cdBlob,eocd]);
   }
-});
-</script>
-<script>
-// show banner when file:// (not required anymore, but nice guidance)
-if(location.protocol==='file:'){ document.getElementById('protoBanner').classList.add('show'); }
+  const sst='<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>Header</t></si><si><t>Value</t></si><si><t>Net Sales</t></si><si><t>Avg $/Cart</t></si><si><t>Transactions</t></si><si><t>Tender</t></si><si><t>Gift Card</t></si><si><t>Cash</t></si></sst>';
+  const sheet1='<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row><row r="2"><c r="A2" t="s"><v>2</v></c><c r="B2">12345.67</c></row><row r="3"><c r="A3" t="s"><v>3</v></c><c r="B3">42.1</c></row><row r="4"><c r="A4" t="s"><v>4</v></c><c r="B4">321</c></row><row r="5"><c r="A5" t="s"><v>5</v></c><c r="B5" t="s"><v>6</v></c></row><row r="6"><c r="A6" t="s"><v>5</v></c><c r="B6" t="s"><v>7</v></c></row></sheetData></worksheet>';
+  const wb='<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>';
+  const rels='<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.xml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"/></Relationships>';
+  const contentTypes='<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>';
+  const relsRoot='<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId0" Target="xl/workbook.xml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"/></Relationships>';
+  const testZip=zipStore({'[Content_Types].xml':enc(contentTypes),'_rels/.rels':enc(relsRoot),'xl/workbook.xml':enc(wb),'xl/_rels/workbook.xml.rels':enc(rels),'xl/sharedStrings.xml':enc(sst),'xl/worksheets/sheet1.xml':enc(sheet1)});
+  const rowsX=await __XLSX.parseXLSX(testZip.buffer); const yx=parseClosing(rowsX);
+  const okCSV=isFinite(y.netSales)&&Math.abs(y.netSales-12345.67)<1e-6&&isFinite(y.atv)&&Math.abs(y.atv-42.1)<1e-6&&isFinite(y.txns)&&y.txns===321&&y.deliveries===1&&f.count===2;
+  const okXLSX=isFinite(yx.netSales)&&Math.abs(yx.netSales-12345.67)<1e-6&&isFinite(yx.atv)&&Math.abs(yx.atv-42.1)<1e-6&&isFinite(yx.txns)&&yx.txns===321&&yx.deliveries===1;
+  $('testOut').innerHTML = (okCSV&&okXLSX)? '<span class="green">All tests passed (CSV + XLSX).</span>' : '<span class="red">Tests failed.</span>';
+} catch(e){ $('testOut').innerHTML='<span class="red">Test error: '+(e.message||e)+'</span>'; }});
 </script>
 </body>
 </html>
